@@ -14,6 +14,7 @@ from pathlib import Path
 from PIL import Image
 from pathlib import Path
 import math
+from difflib import SequenceMatcher
 
 # reads the card names
 txt_file = Path(sys.argv[1]).resolve()
@@ -28,6 +29,29 @@ headers = {
 '''
 UTILITY FUNCTIONS
 '''
+# Minimum similarity (0-1) between the requested name and a fuzzy-matched
+# name before we trust the match. Below this, Scryfall likely resolved to an
+# unrelated card, so we reject rather than silently proxy the wrong card.
+FUZZY_ACCEPT_THRESHOLD = 0.6
+
+
+def _name_similarity(requested, matched):
+    """Similarity of the requested name to the matched card name (0-1).
+
+    DFC/adventure names come back as "Front // Back"; we score against the
+    best-matching individual face as well as the full name so a request for
+    one face isn't unfairly penalized.
+    """
+    requested = requested.casefold().strip()
+    candidates = [matched.casefold().strip()]
+    candidates += [part.strip() for part in matched.casefold().split("//")]
+
+    return max(
+        SequenceMatcher(None, requested, cand).ratio()
+        for cand in candidates
+    )
+
+
 def card_lookup(card_name):
     card_name = re.sub(r"^\d+\s+", "", card_name.strip())
 
@@ -41,9 +65,12 @@ def card_lookup(card_name):
 
     time.sleep(0.1)
 
+    used_fuzzy = False
+
     # if exact lookup fails, try fuzzy matching
     if response.status_code == 404:
         print(f"Exact match failed for '{card_name}', trying fuzzy...")
+        used_fuzzy = True
         response = requests.get(
             "https://api.scryfall.com/cards/named",
             params={"fuzzy": card_name},
@@ -58,7 +85,26 @@ def card_lookup(card_name):
         sys.exit(1)
 
     result = response.json()
-    print(f"Matched: {result['name']}")
+    matched_name = result["name"]
+
+    # A fuzzy match can silently resolve to an unrelated card. Verify the
+    # result actually resembles what was requested before trusting it.
+    if used_fuzzy:
+        similarity = _name_similarity(card_name, matched_name)
+        if similarity < FUZZY_ACCEPT_THRESHOLD:
+            print(
+                f"Rejected fuzzy match for '{card_name}': resolved to "
+                f"'{matched_name}' (similarity {similarity:.2f} < "
+                f"{FUZZY_ACCEPT_THRESHOLD}). Check the spelling in your "
+                f"decklist."
+            )
+            sys.exit(1)
+        print(
+            f"Fuzzy-matched '{card_name}' -> '{matched_name}' "
+            f"(similarity {similarity:.2f})"
+        )
+    else:
+        print(f"Matched: {matched_name}")
 
     return result
 
@@ -73,6 +119,34 @@ def download_image(name):
     # Handle double-faced cards
     if card_json.get("card_faces"):
         faces = card_json["card_faces"]
+
+        # Some DFCs (e.g. "Stormshriek Feral // Flush Out") don't carry
+        # per-face PNGs. In that case the PNG lives on the top-level card,
+        # which represents a single physical card showing both faces, so we
+        # save it once instead of per face.
+        faces_have_png = any(
+            face.get("image_uris", {}).get("png") for face in faces
+        )
+
+        if not faces_have_png:
+            top_image_uris = card_json.get("image_uris") or {}
+            top_png = top_image_uris.get("png")
+
+            if not top_png:
+                print(f"  No image available: {name}")
+                return
+
+            safe_name = re.sub(r'[<>:"/\\|?*]', "_", card_json["name"])
+            output_file = os.path.join("downloads", f"{safe_name}.png")
+
+            image_response = requests.get(top_png, headers=headers, timeout=30)
+            image_response.raise_for_status()
+
+            with open(output_file, "wb") as image_file:
+                image_file.write(image_response.content)
+
+            print(f"  Saved {output_file}")
+            return
 
         for i, face in enumerate(faces):
             image_uris = face.get("image_uris")
